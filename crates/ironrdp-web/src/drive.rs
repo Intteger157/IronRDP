@@ -19,7 +19,10 @@
 //! so a reply that arrives after the channel was reset is recognized as stale
 //! and dropped. Directory listings are fetched whole on the initial query and
 //! served from memory afterwards, so enumerating a directory costs one round
-//! trip instead of one per entry.
+//! trip instead of one per entry. The metadata that a `create` reply carries
+//! answers information queries until something changes the drive, and closing
+//! a handle that changed nothing completes at once: JavaScript gets the close
+//! as a notification (ID 0) and must handle requests in order.
 //!
 //! Times cross to JavaScript as Unix milliseconds, which stay exact in a
 //! JavaScript number, unlike Windows FILETIME values.
@@ -63,6 +66,8 @@ const FILE_DEVICE_DISK: u32 = 0x0000_0007;
 /// Reported allocation unit: 8 sectors of 512 bytes.
 const BYTES_PER_SECTOR: u32 = 512;
 const SECTORS_PER_UNIT: u32 = 8;
+/// FILE_DELETE_ON_CLOSE create option.
+const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
 
 fn ms_to_filetime(ms: f64) -> i64 {
     if !ms.is_finite() || ms <= 0.0 {
@@ -402,7 +407,8 @@ fn parse_stat(value: JsValue) -> anyhow::Result<DriveStat> {
 /// How to complete an IRP once JavaScript answers.
 #[derive(Debug)]
 enum Pending {
-    Create(DeviceIoRequest),
+    /// The flag is FILE_DELETE_ON_CLOSE.
+    Create(DeviceIoRequest, bool),
     Close(DeviceIoRequest),
     Read(DeviceIoRequest),
     Write(DeviceIoRequest),
@@ -437,6 +443,19 @@ pub(crate) struct WasmDriveBackend {
     next_id: u32,
     /// Remaining entries of each directory being enumerated, by (device, file).
     listings: HashMap<(u32, u32), VecDeque<DriveStat>>,
+    /// Open handles, by (device, file).
+    files: HashMap<(u32, u32), OpenFile>,
+}
+
+/// What the backend knows about an open handle.
+#[derive(Debug, Default)]
+struct OpenFile {
+    /// Metadata answering information queries without a round trip. Every
+    /// change on the drive drops the metadata of all its handles.
+    stat: Option<DriveStat>,
+    /// Whether the handle changed anything (or deletes on close), so its
+    /// close must wait for JavaScript; other closes complete at once.
+    dirty: bool,
 }
 
 impl WasmDriveBackend {
@@ -447,6 +466,7 @@ impl WasmDriveBackend {
             pending: HashMap::new(),
             next_id: 1,
             listings: HashMap::new(),
+            files: HashMap::new(),
         }
     }
 
@@ -469,6 +489,7 @@ impl WasmDriveBackend {
     pub(crate) fn reset(&mut self) {
         self.pending.clear();
         self.listings.clear();
+        self.files.clear();
         let _ = self.proxy.send(DriveRequest {
             id: 0,
             device_id: 0,
@@ -492,6 +513,19 @@ impl WasmDriveBackend {
                 result_code: u32::from(result_code),
             },
         });
+    }
+
+    /// Records that the handle `key` changes the drive: its close must wait,
+    /// and the cached metadata of every handle on the drive is stale.
+    fn touch(&mut self, key: (u32, u32)) {
+        self.forget_stats(key.0);
+        self.files.entry(key).or_default().dirty = true;
+    }
+
+    fn forget_stats(&mut self, device_id: u32) {
+        for (_, file) in self.files.iter_mut().filter(|((device, _), _)| *device == device_id) {
+            file.stat = None;
+        }
     }
 
     /// Queues `op` for JavaScript, or fails the IRP when that is impossible.
@@ -520,6 +554,7 @@ impl WasmDriveBackend {
         match req {
             ServerDriveIoRequest::ServerCreateDriveRequest(create) => {
                 let io = create.device_io_request;
+                let delete_on_close = create.create_options.bits() & FILE_DELETE_ON_CLOSE != 0;
                 let op = DriveOp::Create {
                     path: create.path,
                     desired_access: create.desired_access.bits(),
@@ -528,11 +563,27 @@ impl WasmDriveBackend {
                     attributes: create.file_attributes.bits(),
                     share_access: create.shared_access.bits(),
                 };
-                self.defer(&io.clone(), op, Pending::Create(io))
+                self.defer(&io.clone(), op, Pending::Create(io, delete_on_close))
             }
             ServerDriveIoRequest::DeviceCloseRequest(close) => {
                 let io = close.device_io_request;
-                self.listings.remove(&(io.device_id, io.file_id));
+                let key = (io.device_id, io.file_id);
+                self.listings.remove(&key);
+                if self.files.remove(&key).is_some_and(|file| !file.dirty) {
+                    // Nothing waits on this close: JavaScript handles requests in
+                    // order, so the handle is gone before the next one runs.
+                    let _ = self.proxy.send(DriveRequest {
+                        id: 0,
+                        device_id: io.device_id,
+                        file_id: io.file_id,
+                        op: DriveOp::Close,
+                    });
+                    return Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(
+                        DeviceCloseResponse {
+                            device_io_response: DeviceIoResponse::new(io, NtStatus::SUCCESS),
+                        },
+                    ))]);
+                }
                 self.defer(&io.clone(), DriveOp::Close, Pending::Close(io))
             }
             ServerDriveIoRequest::DeviceReadRequest(read) => {
@@ -548,6 +599,7 @@ impl WasmDriveBackend {
             }
             ServerDriveIoRequest::DeviceWriteRequest(write) => {
                 let io = write.device_io_request;
+                self.touch((io.device_id, io.file_id));
                 let op = DriveOp::Write {
                     offset: write.offset,
                     data: write.write_data,
@@ -564,6 +616,19 @@ impl WasmDriveBackend {
                         | FileInformationClassLevel::FILE_ATTRIBUTE_TAG_INFORMATION
                 ) {
                     return fail(Pending::Information(io, class), NtStatus::NOT_SUPPORTED);
+                }
+                if let Some(stat) = self
+                    .files
+                    .get(&(io.device_id, io.file_id))
+                    .and_then(|file| file.stat.as_ref())
+                {
+                    let info = file_information(class, stat);
+                    return Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryInformationResponse(
+                        ClientDriveQueryInformationResponse {
+                            device_io_response: DeviceIoResponse::new(io, NtStatus::SUCCESS),
+                            buffer: Some(info),
+                        },
+                    ))]);
                 }
                 self.defer(&io.clone(), DriveOp::Stat, Pending::Information(io, class))
             }
@@ -624,6 +689,7 @@ impl WasmDriveBackend {
                     _ => return set_response(&set, NtStatus::NOT_SUPPORTED),
                 };
                 let io = set.device_io_request.clone();
+                self.touch((io.device_id, io.file_id));
                 self.defer(&io, op, Pending::Set(set))
             }
             // Writes reach the file directly, so there is nothing to flush.
@@ -672,15 +738,30 @@ impl WasmDriveBackend {
         let status = NtStatus::from(reply.status);
         let ok = status == NtStatus::SUCCESS;
         let message = match pending {
-            Pending::Create(io) => SvcMessage::from(RdpdrPdu::DeviceCreateResponse(DeviceCreateResponse {
-                device_io_reply: DeviceIoResponse::new(io, status),
-                file_id: if ok { reply.file_id } else { 0 },
-                information: if ok {
-                    Information::from_bits_retain(reply.information.min(3))
-                } else {
-                    Information::empty()
-                },
-            })),
+            Pending::Create(io, delete_on_close) => {
+                if ok {
+                    // A create that made or emptied a file changes the drive.
+                    if reply.information != 1 {
+                        self.forget_stats(io.device_id);
+                    }
+                    self.files.insert(
+                        (io.device_id, reply.file_id),
+                        OpenFile {
+                            stat: reply.stat,
+                            dirty: delete_on_close,
+                        },
+                    );
+                }
+                SvcMessage::from(RdpdrPdu::DeviceCreateResponse(DeviceCreateResponse {
+                    device_io_reply: DeviceIoResponse::new(io, status),
+                    file_id: if ok { reply.file_id } else { 0 },
+                    information: if ok {
+                        Information::from_bits_retain(reply.information.min(3))
+                    } else {
+                        Information::empty()
+                    },
+                }))
+            }
             Pending::Close(io) => SvcMessage::from(RdpdrPdu::DeviceCloseResponse(DeviceCloseResponse {
                 // A close always succeeds ([MS-FSA] 2.1.5.5 defines no failure).
                 device_io_response: DeviceIoResponse::new(io, NtStatus::SUCCESS),
@@ -695,7 +776,13 @@ impl WasmDriveBackend {
             })),
             Pending::Information(io, class) => {
                 let buffer = match (ok, reply.stat) {
-                    (true, Some(stat)) => Some(file_information(class, &stat)),
+                    (true, Some(stat)) => {
+                        let info = file_information(class, &stat);
+                        if let Some(file) = self.files.get_mut(&(io.device_id, io.file_id)) {
+                            file.stat = Some(stat);
+                        }
+                        Some(info)
+                    }
                     (true, None) => return fail(Pending::Information(io, class), NtStatus::UNSUCCESSFUL),
                     (false, _) => None,
                 };
@@ -910,7 +997,7 @@ fn set_response(set: &ServerDriveSetInformationRequest, status: NtStatus) -> Pdu
 /// Completes a deferred IRP with an error and no data.
 fn fail(pending: Pending, status: NtStatus) -> PduResult<Vec<SvcMessage>> {
     let message = match pending {
-        Pending::Create(io) => SvcMessage::from(RdpdrPdu::DeviceCreateResponse(DeviceCreateResponse {
+        Pending::Create(io, _) => SvcMessage::from(RdpdrPdu::DeviceCreateResponse(DeviceCreateResponse {
             device_io_reply: DeviceIoResponse::new(io, status),
             file_id: 0,
             information: Information::empty(),
@@ -977,8 +1064,8 @@ mod tests {
     }
 
     fn next_request(rx: &mut mpsc::UnboundedReceiver<RdpInputEvent>) -> DriveRequest {
-        match rx.try_next() {
-            Ok(Some(RdpInputEvent::DriveRequest(request))) => request,
+        match rx.try_recv() {
+            Ok(RdpInputEvent::DriveRequest(request)) => request,
             other => panic!("expected a drive request, got {other:?}"),
         }
     }
@@ -1060,7 +1147,7 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(out.len(), 1);
-        assert!(rx.try_next().is_err());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -1098,7 +1185,7 @@ mod tests {
         for completion_id in 2..=4 {
             assert_eq!(backend.handle(query(3, completion_id, 0)).unwrap().len(), 1);
         }
-        assert!(rx.try_next().is_err());
+        assert!(rx.try_recv().is_err());
         assert!(backend.listings.is_empty());
 
         // Closing the handle forgets a listing that was not finished.
@@ -1118,6 +1205,88 @@ mod tests {
             }))
             .unwrap();
         assert!(backend.listings.is_empty());
+    }
+
+    fn open(backend: &mut WasmDriveBackend, rx: &mut mpsc::UnboundedReceiver<RdpInputEvent>, completion_id: u32) {
+        backend
+            .handle(ServerDriveIoRequest::ServerCreateDriveRequest(DeviceCreateRequest {
+                device_io_request: io(0, completion_id, MajorFunction::Create),
+                desired_access: DesiredAccess::GENERIC_READ,
+                allocation_size: 0,
+                file_attributes: FileAttributes::empty(),
+                shared_access: SharedAccess::FILE_SHARE_READ,
+                create_disposition: CreateDisposition::FILE_OPEN,
+                create_options: CreateOptions::empty(),
+                path: "\\a.txt".to_owned(),
+            }))
+            .unwrap();
+        let request = next_request(rx);
+        backend
+            .complete(DriveReply {
+                id: request.id,
+                file_id: 5,
+                information: 1,
+                stat: Some(DriveStat {
+                    size: 3,
+                    ..DriveStat::default()
+                }),
+                ..DriveReply::default()
+            })
+            .unwrap();
+    }
+
+    fn query_information(backend: &mut WasmDriveBackend, completion_id: u32) -> usize {
+        backend
+            .handle(ServerDriveIoRequest::ServerDriveQueryInformationRequest(
+                ironrdp::rdpdr::pdu::efs::ServerDriveQueryInformationRequest {
+                    device_io_request: io(5, completion_id, MajorFunction::QueryInformation),
+                    file_info_class_lvl: FileInformationClassLevel::FILE_STANDARD_INFORMATION,
+                },
+            ))
+            .unwrap()
+            .len()
+    }
+
+    fn close(backend: &mut WasmDriveBackend, completion_id: u32) -> usize {
+        backend
+            .handle(ServerDriveIoRequest::DeviceCloseRequest(DeviceCloseRequest {
+                device_io_request: io(5, completion_id, MajorFunction::Close),
+            }))
+            .unwrap()
+            .len()
+    }
+
+    #[test]
+    fn a_handle_that_changed_nothing_is_answered_locally() {
+        let (mut backend, mut rx) = backend();
+        open(&mut backend, &mut rx, 1);
+        // The metadata came with the create and the close needs no reply.
+        assert_eq!(query_information(&mut backend, 2), 1);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(close(&mut backend, 3), 1);
+        let request = next_request(&mut rx);
+        assert_eq!((request.id, request.op), (0, DriveOp::Close));
+    }
+
+    #[test]
+    fn a_write_makes_metadata_and_close_go_to_javascript() {
+        let (mut backend, mut rx) = backend();
+        open(&mut backend, &mut rx, 1);
+        backend
+            .handle(ServerDriveIoRequest::DeviceWriteRequest(
+                ironrdp::rdpdr::pdu::efs::DeviceWriteRequest {
+                    device_io_request: io(5, 2, MajorFunction::Write),
+                    offset: 0,
+                    write_data: vec![1],
+                },
+            ))
+            .unwrap();
+        next_request(&mut rx);
+        assert_eq!(query_information(&mut backend, 3), 0);
+        assert_eq!(next_request(&mut rx).op, DriveOp::Stat);
+        assert_eq!(close(&mut backend, 4), 0);
+        let request = next_request(&mut rx);
+        assert!(request.id != 0 && request.op == DriveOp::Close);
     }
 
     #[test]

@@ -123,8 +123,10 @@ export function printers(list: RedirectedPrinter[]): Extension {
 // The browser cannot open local files, so every filesystem request of the
 // host goes to `driveRequestCallback`; answer each one that has a nonzero
 // `id` with `Session.invokeExtension(driveReply({...}))`. Requests may be
-// answered in any order. Directory listings are fetched whole (`list`) and
-// enumerated from memory. Times are Unix milliseconds; statuses are NTSTATUS
+// answered in any order but must be carried out in the order they arrive: a
+// `close` with `id` 0 (a handle that changed nothing) takes no reply. Directory
+// listings are fetched whole (`list`) and enumerated from memory, and the `stat`
+// of a `create` reply answers metadata queries until the drive changes. Times are Unix milliseconds; statuses are NTSTATUS
 // values (0 is success).
 
 /** A folder announced with {@link drives}. */
@@ -182,13 +184,13 @@ export interface DriveReply {
     status: number;
     /** `create`: the new handle. */
     fileId?: number;
+    /** `create` (optional) and `stat`: the file's metadata. */
     /** `create`: FILE_SUPERSEDED 0, OPENED 1, CREATED 2, OVERWRITTEN 3. */
     information?: number;
     /** `read`: the bytes read. */
     data?: Uint8Array;
     /** `write`: bytes written. */
     length?: number;
-    /** `stat`: the open file. */
     stat?: DriveFileInfo;
     /** `list`: matching entries, including `.` and `..` when they match. */
     entries?: DriveFileInfo[];
