@@ -733,12 +733,15 @@ impl WasmDriveBackend {
             }
             // Change notifications are never completed: there is no watcher.
             ServerDriveIoRequest::ServerDriveNotifyChangeDirectoryRequest(_) => Ok(Vec::new()),
-            ServerDriveIoRequest::DeviceControlRequest(control) => Ok(vec![SvcMessage::from(
-                RdpdrPdu::DeviceControlResponse(DeviceControlResponse {
-                    device_io_reply: DeviceIoResponse::new(control.header, NtStatus::SUCCESS),
-                    output_buffer: None,
-                }),
-            )]),
+            ServerDriveIoRequest::DeviceControlRequest(control) => {
+                let status = fsctl_status(control.io_control_code.0);
+                Ok(vec![SvcMessage::from(RdpdrPdu::DeviceControlResponse(
+                    DeviceControlResponse {
+                        device_io_reply: DeviceIoResponse::new(control.header, status),
+                        output_buffer: None,
+                    },
+                ))])
+            }
             ServerDriveIoRequest::ServerDriveQuerySecurityRequest(query) => Ok(vec![SvcMessage::from(
                 RdpdrPdu::ClientDriveQuerySecurityResponse(ClientDriveQuerySecurityResponse {
                     device_io_response: DeviceIoResponse::new(query.device_io_request, NtStatus::NOT_SUPPORTED),
@@ -844,6 +847,26 @@ impl WasmDriveBackend {
             Pending::Set(set) => return set_response(&set, status),
         };
         Ok(vec![message])
+    }
+}
+
+/// FSCTL_IS_VOLUME_MOUNTED.
+const FSCTL_IS_VOLUME_MOUNTED: u32 = 0x0009_0028;
+/// FSCTL_GET_REPARSE_POINT.
+const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00A8;
+/// STATUS_NOT_A_REPARSE_POINT.
+const STATUS_NOT_A_REPARSE_POINT: u32 = 0xC000_0275;
+
+/// Answers a filesystem control request without output, as a file system
+/// without reparse points or object IDs does. A success without the output
+/// the caller asked for would claim, for example, that every file is a link:
+/// Explorer asks FSCTL_GET_REPARSE_POINT for each file and then tries to
+/// resolve it, and link tracking waits on FSCTL_CREATE_OR_GET_OBJECT_ID.
+fn fsctl_status(code: u32) -> NtStatus {
+    match code {
+        FSCTL_IS_VOLUME_MOUNTED => NtStatus::SUCCESS,
+        FSCTL_GET_REPARSE_POINT => NtStatus::from(STATUS_NOT_A_REPARSE_POINT),
+        _ => NtStatus::INVALID_DEVICE_REQUEST,
     }
 }
 
@@ -1406,6 +1429,17 @@ mod tests {
         assert_eq!(close(&mut backend, 4), 0);
         let request = next_request(&mut rx);
         assert!(request.id != 0 && request.op == DriveOp::Close);
+    }
+
+    #[test]
+    fn filesystem_controls_report_no_reparse_points() {
+        assert_eq!(
+            fsctl_status(FSCTL_GET_REPARSE_POINT),
+            NtStatus::from(STATUS_NOT_A_REPARSE_POINT)
+        );
+        assert_eq!(fsctl_status(FSCTL_IS_VOLUME_MOUNTED), NtStatus::SUCCESS);
+        // FSCTL_CREATE_OR_GET_OBJECT_ID
+        assert_eq!(fsctl_status(0x0009_00C0), NtStatus::INVALID_DEVICE_REQUEST);
     }
 
     #[test]
