@@ -836,6 +836,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
             camera,
             monitor_layout_callback,
             drive_request_callback,
+            drive_trace,
 
             input_events_rx: RefCell::new(Some(input_events_rx)),
             rdp_reader: RefCell::new(Some(rdp_reader)),
@@ -993,6 +994,8 @@ pub(crate) struct Session {
     camera: Option<crate::camera::CameraSink>,
     monitor_layout_callback: Option<js_sys::Function>,
     drive_request_callback: Option<js_sys::Function>,
+    /// With `drive_trace`, the event loop reports its traffic every 2 seconds.
+    drive_trace: bool,
 
     // Consumed when `run` is called
     input_events_rx: RefCell<Option<mpsc::UnboundedReceiver<RdpInputEvent>>>,
@@ -1140,17 +1143,23 @@ impl iron_remote_desktop::Session for Session {
 
         // Timer interval for driving clipboard lock timeouts (5 second interval)
         let mut cleanup_interval = IntervalStream::new(5_000).fuse();
+        // Traffic counters for the drive trace pulse.
+        let mut pulse_interval = IntervalStream::new(2_000).fuse();
+        let (mut frames_in, mut bytes_in, mut frames_out, mut bytes_out, mut events) = (0u64, 0u64, 0u64, 0u64, 0u64);
 
         let disconnect_reason = 'outer: loop {
             let outputs = select! {
                 frame = framed.read_pdu().fuse() => {
                     let (action, payload) = frame.context("read frame")?;
                     trace!(?action, frame_length = payload.len(), "Frame received");
+                    frames_in += 1;
+                    bytes_in += u64::try_from(payload.len()).unwrap_or(u64::MAX);
 
                     active_stage.process(&mut image, action, &payload, framed.last_read_at())?
                 }
                 input_events = input_events.next() => {
                     let event = input_events.context("read next input events")?;
+                    events += 1;
 
                     match event {
                         RdpInputEvent::Cliprdr(message) => {
@@ -1374,6 +1383,23 @@ impl iron_remote_desktop::Session for Session {
                         }
                     }
                 }
+                _ = pulse_interval.next() => {
+                    if self.drive_trace
+                        && let Some(callback) = &self.drive_request_callback
+                    {
+                        let text = format!(
+                            "pulse wasm: frames_in={frames_in} bytes_in={bytes_in} frames_out={frames_out} bytes_out={bytes_out} events={events}"
+                        );
+                        let request = crate::drive::DriveRequest {
+                            id: 0,
+                            device_id: 0,
+                            file_id: 0,
+                            op: crate::drive::DriveOp::Note { text },
+                        };
+                        let _ = callback.call1(&JsValue::NULL, &request.to_js());
+                    }
+                    Vec::new()
+                }
                 _ = cleanup_interval.next() => {
                     // Drive clipboard lock timeout cleanup
                     if let Some(cliprdr) = active_stage.get_svc_processor_mut::<CliprdrClient>() {
@@ -1400,6 +1426,8 @@ impl iron_remote_desktop::Session for Session {
             for out in outputs {
                 match out {
                     ActiveStageOutput::ResponseFrame(frame) => {
+                        frames_out += 1;
+                        bytes_out += u64::try_from(frame.len()).unwrap_or(u64::MAX);
                         self.writer_tx
                             .unbounded_send(frame)
                             .context("Send frame to writer task")?;
