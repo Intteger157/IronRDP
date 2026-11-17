@@ -175,6 +175,8 @@ export type DriveRequest = { id: number; deviceId: number; fileId: number } & (
     | { op: 'setDelete'; delete: boolean }
     | { op: 'rename'; to: string; replace: boolean }
     | { op: 'announced'; accepted: boolean; resultCode: number }
+    /** With {@link driveTrace}: a trace line in `path`; no reply. */
+    | { op: 'note'; path: string }
 );
 
 /** The answer to a {@link DriveRequest}. */
@@ -205,6 +207,11 @@ export function drives(list: RedirectedDrive[]): Extension {
 
 export function driveRequestCallback(cb: (request: DriveRequest) => void): Extension {
     return new Extension('drive_request_callback', cb as unknown);
+}
+
+/** Also sends a `note` request (ID 0, text in `path`) for every IRP and every completion, for diagnostics. */
+export function driveTrace(enable: boolean): Extension {
+    return new Extension('drive_trace', enable);
 }
 
 export function driveReply(reply: DriveReply): Extension {

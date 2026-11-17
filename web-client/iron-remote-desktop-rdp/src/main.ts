@@ -240,6 +240,7 @@ export {
     drives,
     driveRequestCallback,
     driveReply,
+    driveTrace,
 } from './extensions';
 export type { RedirectedDrive, DriveRequest, DriveReply, DriveFileInfo } from './extensions';
 export type { PrintJobStreamCallbacks, RedirectedPrinter } from './extensions';

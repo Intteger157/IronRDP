@@ -104,6 +104,7 @@ struct SessionBuilderInner {
     drives: Option<Vec<DriveSpec>>,
     invalid_drives: bool,
     drive_request_callback: Option<js_sys::Function>,
+    drive_trace: bool,
 
     use_display_control: bool,
     audio_playback_callback: Option<js_sys::Function>,
@@ -164,6 +165,7 @@ impl Default for SessionBuilderInner {
             drives: None,
             invalid_drives: false,
             drive_request_callback: None,
+            drive_trace: false,
 
             use_display_control: false,
             audio_playback_callback: None,
@@ -508,6 +510,9 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                     }
                 }
             };
+            |drive_trace: bool| {
+                self.0.borrow_mut().drive_trace = drive_trace;
+            };
             |drive_request_callback: JsValue| {
                 self.0.borrow_mut().drive_request_callback = drive_request_callback.dyn_into::<js_sys::Function>().ok();
             };
@@ -722,8 +727,10 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                 "a printer and a drive have the same deviceId"
             )));
         }
-        let drive_backend = (!drive_specs.is_empty())
-            .then(|| WasmDriveBackend::new(drive_specs, WasmDriveProxy::new(input_events_tx.clone())));
+        let drive_trace = self.0.borrow().drive_trace;
+        let drive_backend = (!drive_specs.is_empty()).then(|| {
+            WasmDriveBackend::new(drive_specs, WasmDriveProxy::new(input_events_tx.clone())).with_trace(drive_trace)
+        });
 
         let printers = match printer_specs {
             Some(specs) => redirected_printers(specs, &drive_ids),

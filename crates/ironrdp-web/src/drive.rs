@@ -156,6 +156,11 @@ pub(crate) enum DriveOp {
     },
     /// The channel restarted: every handle is gone and pending replies are dropped.
     Reset,
+    /// A trace line (with `drive_trace` on): an IRP as it arrived, or a reply
+    /// as it went out.
+    Note {
+        text: String,
+    },
 }
 
 impl DriveOp {
@@ -174,6 +179,7 @@ impl DriveOp {
             Self::Rename { .. } => "rename",
             Self::Announced { .. } => "announced",
             Self::Reset => "reset",
+            Self::Note { .. } => "note",
         }
     }
 }
@@ -226,6 +232,7 @@ impl DriveRequest {
                 set("data", js_sys::Uint8Array::from(data.as_slice()).into());
             }
             DriveOp::List { path } => set("path", path.into()),
+            DriveOp::Note { text } => set("path", text.into()),
             DriveOp::SetBasic {
                 created,
                 accessed,
@@ -445,6 +452,8 @@ pub(crate) struct WasmDriveBackend {
     listings: HashMap<(u32, u32), VecDeque<DriveStat>>,
     /// Open handles, by (device, file).
     files: HashMap<(u32, u32), OpenFile>,
+    /// Sends a `note` for every IRP and every completion.
+    trace: bool,
 }
 
 /// What the backend knows about an open handle.
@@ -467,6 +476,23 @@ impl WasmDriveBackend {
             next_id: 1,
             listings: HashMap::new(),
             files: HashMap::new(),
+            trace: false,
+        }
+    }
+
+    pub(crate) fn with_trace(mut self, trace: bool) -> Self {
+        self.trace = trace;
+        self
+    }
+
+    fn note(&self, text: impl FnOnce() -> String) {
+        if self.trace {
+            let _ = self.proxy.send(DriveRequest {
+                id: 0,
+                device_id: 0,
+                file_id: 0,
+                op: DriveOp::Note { text: text() },
+            });
         }
     }
 
@@ -551,6 +577,7 @@ impl WasmDriveBackend {
     }
 
     pub(crate) fn handle(&mut self, req: ServerDriveIoRequest) -> PduResult<Vec<SvcMessage>> {
+        self.note(|| describe(&req));
         match req {
             ServerDriveIoRequest::ServerCreateDriveRequest(create) => {
                 let io = create.device_io_request;
@@ -733,8 +760,10 @@ impl WasmDriveBackend {
     pub(crate) fn complete(&mut self, reply: DriveReply) -> PduResult<Vec<SvcMessage>> {
         let Some(pending) = self.pending.remove(&reply.id) else {
             debug!(id = reply.id, "Ignoring a drive reply without a pending request");
+            self.note(|| format!("stale reply #{}", reply.id));
             return Ok(Vec::new());
         };
+        self.note(|| format!("completing #{} status={:#x}", reply.id, reply.status));
         let status = NtStatus::from(reply.status);
         let ok = status == NtStatus::SUCCESS;
         let message = match pending {
@@ -815,6 +844,96 @@ impl WasmDriveBackend {
             Pending::Set(set) => return set_response(&set, status),
         };
         Ok(vec![message])
+    }
+}
+
+/// One line about an IRP for the trace, without its data.
+fn describe(req: &ServerDriveIoRequest) -> String {
+    let io = |io: &DeviceIoRequest| format!("cid={} file={}", io.completion_id, io.file_id);
+    match req {
+        ServerDriveIoRequest::ServerCreateDriveRequest(r) => format!(
+            "IRP create {} {} access={:#x} disp={} opts={:#x} share={:#x}",
+            io(&r.device_io_request),
+            r.path,
+            r.desired_access.bits(),
+            u32::from(r.create_disposition),
+            r.create_options.bits(),
+            r.shared_access.bits()
+        ),
+        ServerDriveIoRequest::ServerDriveQueryInformationRequest(r) => {
+            format!(
+                "IRP query-info {} class={:?}",
+                io(&r.device_io_request),
+                r.file_info_class_lvl
+            )
+        }
+        ServerDriveIoRequest::DeviceCloseRequest(r) => format!("IRP close {}", io(&r.device_io_request)),
+        ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(r) => format!(
+            "IRP query-dir {} class={:?} initial={} {}",
+            io(&r.device_io_request),
+            r.file_info_class_lvl,
+            r.initial_query,
+            r.path
+        ),
+        ServerDriveIoRequest::ServerDriveNotifyChangeDirectoryRequest(r) => format!(
+            "IRP notify {} tree={} filter={:#x}",
+            io(&r.device_io_request),
+            r.watch_tree,
+            r.completion_filter
+        ),
+        ServerDriveIoRequest::ServerDriveQueryVolumeInformationRequest(r) => {
+            format!(
+                "IRP query-volume {} class={:?}",
+                io(&r.device_io_request),
+                r.fs_info_class_lvl
+            )
+        }
+        ServerDriveIoRequest::DeviceControlRequest(r) => format!(
+            "IRP ioctl {} code={:?} in={} out={}",
+            io(&r.header),
+            r.io_control_code,
+            r.input_buffer_length,
+            r.output_buffer_length
+        ),
+        ServerDriveIoRequest::DeviceReadRequest(r) => {
+            format!(
+                "IRP read {} off={} len={}",
+                io(&r.device_io_request),
+                r.offset,
+                r.length
+            )
+        }
+        ServerDriveIoRequest::DeviceWriteRequest(r) => format!(
+            "IRP write {} off={} len={}",
+            io(&r.device_io_request),
+            r.offset,
+            r.write_data.len()
+        ),
+        ServerDriveIoRequest::DeviceFlushBuffersRequest(r) => format!("IRP flush {}", io(&r.device_io_request)),
+        ServerDriveIoRequest::ServerDriveSetInformationRequest(r) => {
+            let what = match &r.set_buffer {
+                FileInformationClass::Basic(_) => "basic",
+                FileInformationClass::EndOfFile(_) => "end-of-file",
+                FileInformationClass::Disposition(_) => "disposition",
+                FileInformationClass::Rename(_) => "rename",
+                FileInformationClass::Allocation(_) => "allocation",
+                _ => "other",
+            };
+            format!("IRP set-info {} {what}", io(&r.device_io_request))
+        }
+        ServerDriveIoRequest::ServerDriveLockControlRequest(r) => format!(
+            "IRP lock {} op={:?} wait={} n={}",
+            io(&r.device_io_request),
+            r.operation,
+            r.wait,
+            r.locks.len()
+        ),
+        ServerDriveIoRequest::ServerDriveQuerySecurityRequest(r) => {
+            format!("IRP query-security {}", io(&r.device_io_request))
+        }
+        ServerDriveIoRequest::ServerDriveSetSecurityRequest(r) => {
+            format!("IRP set-security {}", io(&r.device_io_request))
+        }
     }
 }
 
