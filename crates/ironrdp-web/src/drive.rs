@@ -27,7 +27,7 @@
 //! Times cross to JavaScript as Unix milliseconds, which stay exact in a
 //! JavaScript number, unlike Windows FILETIME values.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use futures_channel::mpsc;
 use ironrdp::rdpdr::pdu::RdpdrPdu;
@@ -446,8 +446,16 @@ impl WasmDriveProxy {
 pub(crate) struct WasmDriveBackend {
     drives: Vec<DriveSpec>,
     proxy: WasmDriveProxy,
-    pending: HashMap<u32, Pending>,
+    /// Deferred IRPs by request ID, with their place in the completion order.
+    pending: HashMap<u32, (u64, Pending)>,
     next_id: u32,
+    /// Completions go out in the order the IRPs arrived; see [`Self::handle`].
+    next_seq: u64,
+    next_out: u64,
+    ready: BTreeMap<u64, Vec<SvcMessage>>,
+    /// The sequence number of the IRP being handled, and whether it was deferred.
+    current_seq: u64,
+    deferred: bool,
     /// Remaining entries of each directory being enumerated, by (device, file).
     listings: HashMap<(u32, u32), VecDeque<DriveStat>>,
     /// Open handles, by (device, file).
@@ -474,6 +482,11 @@ impl WasmDriveBackend {
             proxy,
             pending: HashMap::new(),
             next_id: 1,
+            next_seq: 0,
+            next_out: 0,
+            ready: BTreeMap::new(),
+            current_seq: 0,
+            deferred: false,
             listings: HashMap::new(),
             files: HashMap::new(),
             trace: false,
@@ -514,6 +527,8 @@ impl WasmDriveBackend {
     /// Drops every pending IRP and listing; JavaScript closes every handle.
     pub(crate) fn reset(&mut self) {
         self.pending.clear();
+        self.ready.clear();
+        self.next_out = self.next_seq;
         self.listings.clear();
         self.files.clear();
         let _ = self.proxy.send(DriveRequest {
@@ -572,12 +587,46 @@ impl WasmDriveBackend {
             warn!("Drive request could not be queued, the event loop is gone");
             return fail(pending, NtStatus::UNSUCCESSFUL);
         }
-        self.pending.insert(id, pending);
+        self.pending.insert(id, (self.current_seq, pending));
+        self.deferred = true;
         Ok(Vec::new())
     }
 
+    /// Handles a filesystem IRP and returns the completions that may go out now.
+    ///
+    /// Completions are sent in the order the IRPs arrived, even when a later
+    /// one is answered first (from the metadata cache, or because JavaScript
+    /// answered it sooner). The server reads the channel on one thread: a
+    /// completion that overtakes an earlier one can block that thread on a
+    /// lock held by the thread waiting for the earlier completion, which then
+    /// never gets read, and the whole session stops until a timeout. Change
+    /// notifications are never completed, so they take no place in the order.
     pub(crate) fn handle(&mut self, req: ServerDriveIoRequest) -> PduResult<Vec<SvcMessage>> {
         self.note(|| describe(&req));
+        if matches!(req, ServerDriveIoRequest::ServerDriveNotifyChangeDirectoryRequest(_)) {
+            return Ok(Vec::new());
+        }
+        self.current_seq = self.next_seq;
+        self.next_seq += 1;
+        self.deferred = false;
+        let out = self.handle_irp(req)?;
+        if !self.deferred {
+            self.ready.insert(self.current_seq, out);
+        }
+        Ok(self.flush())
+    }
+
+    /// Takes the completions that are next in order.
+    fn flush(&mut self) -> Vec<SvcMessage> {
+        let mut out = Vec::new();
+        while let Some(messages) = self.ready.remove(&self.next_out) {
+            out.extend(messages);
+            self.next_out += 1;
+        }
+        out
+    }
+
+    fn handle_irp(&mut self, req: ServerDriveIoRequest) -> PduResult<Vec<SvcMessage>> {
         match req {
             ServerDriveIoRequest::ServerCreateDriveRequest(create) => {
                 let io = create.device_io_request;
@@ -761,12 +810,27 @@ impl WasmDriveBackend {
     /// Completes the IRP JavaScript answered. A reply to an unknown or stale
     /// request is ignored.
     pub(crate) fn complete(&mut self, reply: DriveReply) -> PduResult<Vec<SvcMessage>> {
-        let Some(pending) = self.pending.remove(&reply.id) else {
+        let Some((seq, pending)) = self.pending.remove(&reply.id) else {
             debug!(id = reply.id, "Ignoring a drive reply without a pending request");
             self.note(|| format!("stale reply #{}", reply.id));
             return Ok(Vec::new());
         };
-        self.note(|| format!("completing #{} status={:#x}", reply.id, reply.status));
+        let id = reply.id;
+        let messages = self.completion(pending, reply)?;
+        self.ready.insert(seq, messages);
+        let out = self.flush();
+        self.note(|| {
+            format!(
+                "completing #{id} seq={seq} sent={} waiting={}",
+                out.len(),
+                self.ready.len()
+            )
+        });
+        Ok(out)
+    }
+
+    /// Builds the completion of a deferred IRP from JavaScript's reply.
+    fn completion(&mut self, pending: Pending, reply: DriveReply) -> PduResult<Vec<SvcMessage>> {
         let status = NtStatus::from(reply.status);
         let ok = status == NtStatus::SUCCESS;
         let message = match pending {
@@ -1429,6 +1493,43 @@ mod tests {
         assert_eq!(close(&mut backend, 4), 0);
         let request = next_request(&mut rx);
         assert!(request.id != 0 && request.op == DriveOp::Close);
+    }
+
+    #[test]
+    fn completions_go_out_in_the_order_the_irps_arrived() {
+        let (mut backend, mut rx) = backend();
+        open(&mut backend, &mut rx, 1);
+        // A read goes to JavaScript; a later metadata query is answered from the cache.
+        let read = backend
+            .handle(ServerDriveIoRequest::DeviceReadRequest(DeviceReadRequest {
+                device_io_request: io(5, 2, MajorFunction::Read),
+                length: 3,
+                offset: 0,
+            }))
+            .unwrap();
+        assert!(read.is_empty());
+        let request = next_request(&mut rx);
+        // The cached answer waits for the read.
+        assert_eq!(query_information(&mut backend, 3), 0);
+        // A change notification is never answered and holds nothing up.
+        backend
+            .handle(ServerDriveIoRequest::ServerDriveNotifyChangeDirectoryRequest(
+                ironrdp::rdpdr::pdu::efs::ServerDriveNotifyChangeDirectoryRequest {
+                    device_io_request: io(5, 4, MajorFunction::DirectoryControl),
+                    watch_tree: 0,
+                    completion_filter: 1,
+                },
+            ))
+            .unwrap();
+        let out = backend
+            .complete(DriveReply {
+                id: request.id,
+                data: vec![1, 2, 3],
+                ..DriveReply::default()
+            })
+            .unwrap();
+        assert_eq!(out.len(), 2, "the read and then the query");
+        assert_eq!(query_information(&mut backend, 5), 1);
     }
 
     #[test]
