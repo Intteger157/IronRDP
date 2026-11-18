@@ -57,6 +57,7 @@
     let currentScreenScale = ScreenScale.Fit;
     let destroyed = false;
     let visibilityTimer: ReturnType<typeof setTimeout> | undefined;
+    let hostObserver: ResizeObserver | undefined;
 
     function captureKeys(evt: KeyboardEvent) {
         if (capturingInputs()) {
@@ -70,6 +71,12 @@
 
         window.addEventListener('keydown', captureKeys, false);
         window.addEventListener('keyup', captureKeys, false);
+
+        // The element can change size without the window changing (a resizable side panel, a split view).
+        if (typeof ResizeObserver !== 'undefined') {
+            hostObserver = new ResizeObserver(() => scaleSession(currentScreenScale));
+            hostObserver.observe(hostElement());
+        }
 
         window.addEventListener('focus', focusEventHandler);
         window.addEventListener('blur', blurEventHandler);
@@ -134,8 +141,9 @@
         });
 
         remoteDesktopService.dynamicResizeObservable.subscribe((evt) => {
+            // The size is in desktop pixels, which differ from CSS pixels on high-density screens and when the
+            // picture is scaled, so the viewer is resized once the server reports the new desktop size.
             loggingService.info(`Dynamic resize!, width: ${evt.width}, height: ${evt.height}`);
-            setViewerStyle(evt.height.toString() + 'px', evt.width.toString() + 'px', true);
         });
 
         remoteDesktopService.changeVisibilityObservable.subscribe((val) => {
@@ -187,10 +195,7 @@
     }
 
     function fullResize() {
-        const windowSize = getWindowSize();
-
-        const containerWidth = windowSize.x;
-        const containerHeight = windowSize.y;
+        const { width: containerWidth, height: containerHeight } = containerSize();
 
         let width = canvas.width;
         let height = canvas.height;
@@ -208,11 +213,7 @@
     }
 
     function fitResize(realSizeLimit = false) {
-        const windowSize = getWindowSize();
-        const wrapperBoundingBox = wrapper.getBoundingClientRect();
-
-        const containerWidth = windowSize.x - wrapperBoundingBox.x;
-        const containerHeight = windowSize.y - wrapperBoundingBox.y;
+        const { width: containerWidth, height: containerHeight } = containerSize();
 
         let width = canvas.width;
         let height = canvas.height;
@@ -232,11 +233,7 @@
     }
 
     function realResize() {
-        const windowSize = getWindowSize();
-        const wrapperBoundingBox = wrapper.getBoundingClientRect();
-
-        const containerWidth = windowSize.x - wrapperBoundingBox.x;
-        const containerHeight = windowSize.y - wrapperBoundingBox.y;
+        const { width: containerWidth, height: containerHeight } = containerSize();
 
         if (containerWidth < canvas.width || containerHeight < canvas.height) {
             setWrapperStyle(
@@ -287,6 +284,23 @@
 
         // Propagate further
         return true;
+    }
+
+    // The custom element; `inner` lives in its shadow root.
+    function hostElement(): HTMLElement {
+        const root = inner.getRootNode();
+        return root instanceof ShadowRoot ? (root.host as HTMLElement) : (inner.parentElement ?? inner);
+    }
+
+    // The space the picture may take: the element's own box, so the page around it (toolbars, side panels, a
+    // status bar below it) is never covered. Before layout gives the element a size, the window is used.
+    function containerSize() {
+        const rect = hostElement().getBoundingClientRect();
+        if (rect.width >= 1 && rect.height >= 1) {
+            return { width: rect.width, height: rect.height };
+        }
+        const windowSize = getWindowSize();
+        return { width: windowSize.x, height: windowSize.y };
     }
 
     function getWindowSize() {
@@ -362,6 +376,7 @@
     onDestroy(() => {
         destroyed = true;
         clearTimeout(visibilityTimer);
+        hostObserver?.disconnect();
         clipboardService.dispose();
         window.removeEventListener('resize', resizeHandler);
         window.removeEventListener('keydown', captureKeys, false);
