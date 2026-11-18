@@ -190,6 +190,13 @@
                     realResize();
                     scale = 'real';
                     break;
+                case 'stretch':
+                case ScreenScale.Stretch:
+                    loggingService.info('Size to stretch');
+                    currentScreenScale = ScreenScale.Stretch;
+                    stretchResize();
+                    scale = 'stretch';
+                    break;
             }
         }
     }
@@ -230,6 +237,17 @@
         setWrapperStyle('initial', 'initial', 'hidden');
         setViewerStyle(`${height}px`, `${width}px`, true);
         setHostStyle(false);
+    }
+
+    // Fills the element exactly, like mstsc's smart sizing: a desktop whose aspect ratio differs from the element's
+    // (the server didn't take the requested size) is stretched instead of letterboxed. Pointer positions are mapped
+    // per axis, so input stays accurate.
+    function stretchResize() {
+        const { width, height } = containerSize();
+
+        setWrapperStyle('100%', '100%', 'hidden');
+        setViewerStyle(`${Math.max(height, 0)}px`, `${Math.max(width, 0)}px`, true);
+        setHostStyle(true);
     }
 
     function realResize() {
