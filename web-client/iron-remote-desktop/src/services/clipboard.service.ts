@@ -3,6 +3,7 @@ import type { ClipboardData } from '../interfaces/ClipboardData';
 import type { RemoteDesktopModule } from '../interfaces/RemoteDesktopModule';
 import { ClipboardApiSupported } from '../enums/ClipboardApiSupported';
 import { IronErrorKind } from '../interfaces/Error';
+import type { ClipboardProvider } from '../interfaces/ClipboardProvider';
 
 const CLIPBOARD_MONITORING_INTERVAL_MS = 100;
 
@@ -38,6 +39,8 @@ export class ClipboardService {
     private resumeOnGrant?: AbortController;
     // Only the latest remote clipboard content is written once the window has the focus again.
     private pendingFocus: (() => Promise<void> | void) | null = null;
+    // Set by the host: it reads and writes the clipboard instead of `navigator.clipboard`.
+    private provider: ClipboardProvider | null = null;
 
     constructor(remoteDesktopService: RemoteDesktopService, module: RemoteDesktopModule) {
         this.remoteDesktopService = remoteDesktopService;
@@ -79,6 +82,24 @@ export class ClipboardService {
     dispose(): void {
         this.disposed = true;
         this.stopMonitoring();
+    }
+
+    /**
+     * Uses `provider` for the local clipboard, in automatic mode, whatever the browser's clipboard API supports.
+     * Runs after initClipboard (the component is ready only then), so it replaces the callbacks set there.
+     */
+    setProvider(provider: ClipboardProvider): void {
+        const first = this.provider == null;
+        this.provider = provider;
+        this.remoteDesktopService.setOnForceClipboardUpdate(this.onForceClipboardUpdate.bind(this));
+        this.remoteDesktopService.setOnRemoteClipboardChanged(this.onRemoteClipboardChangedProvider.bind(this));
+        if (first) {
+            this.remoteDesktopService.sessionEndedObservable.subscribe(() => this.stopMonitoring());
+            this.remoteDesktopService.sessionStartedObservable.subscribe((_) => {
+                this.monitoringActive = !this.disposed;
+                this.scheduleOnMonitorClipboardUpdate();
+            });
+        }
     }
 
     async initClipboard() {
@@ -268,7 +289,11 @@ export class ClipboardService {
             this.monitoringActive && !this.disposed
                 ? setTimeout(() => {
                       this.monitorTimer = undefined;
-                      this.onMonitorClipboard();
+                      if (this.provider) {
+                          this.onMonitorProvider();
+                      } else {
+                          this.onMonitorClipboard();
+                      }
                   }, CLIPBOARD_MONITORING_INTERVAL_MS)
                 : undefined;
     }
@@ -357,6 +382,55 @@ export class ClipboardService {
             });
         } catch (err) {
             console.error('Failed to set client clipboard: ' + err);
+        }
+    }
+
+    private onRemoteClipboardChangedProvider(data: ClipboardData) {
+        const provider = this.provider;
+        if (this.disposed || provider == null) {
+            return;
+        }
+        const items = this.clipboardDataToClipboardItemsRecord(data);
+        this.lastReceivedClipboardData = items;
+        provider.write(items).catch((err) => console.error('Failed to set client clipboard: ' + err));
+    }
+
+    // The monitoring loop with a host's provider: it reports only changes, and never the content it was given.
+    private async onMonitorProvider(): Promise<void> {
+        try {
+            const provider = this.provider;
+            if (provider == null || this.disposed || !this.monitoringActive || this.monitoringSuppressed) {
+                return;
+            }
+            if (!document.hasFocus()) {
+                return;
+            }
+            const items = await provider.read();
+            if (items == null || this.disposed || !this.monitoringActive || this.monitoringSuppressed) {
+                return;
+            }
+            const clipboardData = new this.module.ClipboardData();
+            for (const [kind, value] of Object.entries(items)) {
+                if (kind.startsWith('text/') && typeof value === 'string' && value !== '') {
+                    clipboardData.addText(kind, value);
+                } else if (kind.startsWith('image/') && value instanceof Uint8Array && value.length > 0) {
+                    clipboardData.addBinary(kind, value);
+                }
+            }
+            if (!clipboardData.isEmpty()) {
+                this.lastSentClipboardData = clipboardData;
+                await this.remoteDesktopService.onClipboardChanged(clipboardData);
+            }
+        } catch (err) {
+            if (err instanceof Error || typeof err === 'string') {
+                const text = String(err);
+                if (this.lastClipboardMonitorLoopError?.toString() !== text) {
+                    console.error('Clipboard monitoring error: ' + text);
+                }
+                this.lastClipboardMonitorLoopError = new Error(text);
+            }
+        } finally {
+            this.scheduleOnMonitorClipboardUpdate();
         }
     }
 

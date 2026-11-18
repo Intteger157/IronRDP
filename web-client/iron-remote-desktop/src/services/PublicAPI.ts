@@ -9,6 +9,7 @@ import { Config } from './Config';
 import type { Extension } from '../interfaces/Extension';
 import type { ClipboardService } from './clipboard.service';
 import type { FileTransferProvider } from '../interfaces/FileTransferProvider';
+import type { ClipboardProvider } from '../interfaces/ClipboardProvider';
 
 export class PublicAPI {
     private remoteDesktopService: RemoteDesktopService;
@@ -93,6 +94,10 @@ export class PublicAPI {
         return await this.clipboardService.sendClipboardData();
     }
 
+    private setClipboardProvider(provider: ClipboardProvider) {
+        this.clipboardService.setProvider(provider);
+    }
+
     private invokeExtension(ext: Extension) {
         this.remoteDesktopService.invokeExtension(ext);
     }
@@ -134,6 +139,7 @@ export class PublicAPI {
             saveRemoteClipboardData: this.saveRemoteClipboardData.bind(this),
             sendClipboardData: this.sendClipboardData.bind(this),
             invokeExtension: this.invokeExtension.bind(this),
+            setClipboardProvider: this.setClipboardProvider.bind(this),
             enableFileTransfer: this.enableFileTransfer.bind(this),
         };
     }

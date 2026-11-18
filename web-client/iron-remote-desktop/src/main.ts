@@ -12,5 +12,6 @@ export type { SessionBuilder } from './interfaces/SessionBuilder';
 export type { DesktopSize } from './interfaces/DesktopSize';
 export type { UserInteraction } from './interfaces/UserInteraction';
 export type { FileTransferProvider } from './interfaces/FileTransferProvider';
+export type { ClipboardProvider } from './interfaces/ClipboardProvider';
 export { Config } from './services/Config';
 export { ConfigBuilder } from './services/ConfigBuilder';

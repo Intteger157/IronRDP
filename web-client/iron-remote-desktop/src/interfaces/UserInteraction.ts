@@ -5,6 +5,7 @@ import type { Config } from '../services/Config';
 import type { Extension } from './Extension';
 import type { Callback } from '../lib/Observable';
 import type { FileTransferProvider } from './FileTransferProvider';
+import type { ClipboardProvider } from './ClipboardProvider';
 
 export interface UserInteraction {
     setVisibility(state: boolean): void;
@@ -44,6 +45,12 @@ export interface UserInteraction {
     sendClipboardData(): Promise<void>;
 
     invokeExtension(ext: Extension): void;
+
+    /**
+     * Uses `provider` for the local clipboard instead of `navigator.clipboard`, with automatic clipboard sync: it is
+     * polled while the page has the focus, and what the server copies is written to it. Call it before connect().
+     */
+    setClipboardProvider(provider: ClipboardProvider): void;
 
     /**
      * Enable file transfer support. Must be called before connect().
